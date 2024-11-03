@@ -28,6 +28,7 @@ namespace MediaBrowser.Providers.MediaInfo
     public class AudioFileProber
     {
         private const char InternalValueSeparator = '\u001F';
+
         private readonly IMediaEncoder _mediaEncoder;
         private readonly IItemRepository _itemRepo;
         private readonly ILibraryManager _libraryManager;
@@ -63,6 +64,8 @@ namespace MediaBrowser.Providers.MediaInfo
             _lyricResolver = lyricResolver;
             _lyricManager = lyricManager;
             ATL.Settings.DisplayValueSeparator = InternalValueSeparator;
+            ATL.Settings.UseFileNameWhenNoTitle = false;
+            ATL.Settings.ID3v2_separatev2v3Values = false;
         }
 
         /// <summary>
@@ -161,12 +164,13 @@ namespace MediaBrowser.Providers.MediaInfo
             var libraryOptions = _libraryManager.GetLibraryOptions(audio);
             Track track = new Track(audio.Path);
 
-            // ATL will fall back to filename as title when it does not understand the metadata
-            if (track.MetadataFormats.All(mf => mf.Equals(ATL.Factory.UNKNOWN_FORMAT)))
+            if (track.MetadataFormats
+                .All(mf => string.Equals(mf.ShortName, "ID3v1", StringComparison.OrdinalIgnoreCase)))
             {
-                track.Title = mediaInfo.Name;
+                _logger.LogWarning("File {File} only has ID3v1 tags, some fields may be truncated", audio.Path);
             }
 
+            track.Title = string.IsNullOrEmpty(track.Title) ? mediaInfo.Name : track.Title;
             track.Album = string.IsNullOrEmpty(track.Album) ? mediaInfo.Album : track.Album;
             track.Year ??= mediaInfo.ProductionYear;
             track.TrackNumber ??= mediaInfo.IndexNumber;

@@ -73,6 +73,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         private readonly Version _minFFmpegQsvVppTonemapOption = new Version(7, 0, 1);
         private readonly Version _minFFmpegQsvVppOutRangeOption = new Version(7, 0, 1);
         private readonly Version _minFFmpegVaapiDeviceVendorId = new Version(7, 0, 1);
+        private readonly Version _minFFmpegQsvVppScaleModeOption = new Version(6, 0);
 
         private static readonly Regex _validationRegex = new(ValidationRegex, RegexOptions.Compiled);
 
@@ -628,49 +629,21 @@ namespace MediaBrowser.Controller.MediaEncoding
         /// <returns>Codec string.</returns>
         public string InferAudioCodec(string container)
         {
-            var ext = "." + (container ?? string.Empty);
-
-            if (string.Equals(ext, ".mp3", StringComparison.OrdinalIgnoreCase))
+            if (string.IsNullOrWhiteSpace(container))
             {
-                return "mp3";
-            }
-
-            if (string.Equals(ext, ".aac", StringComparison.OrdinalIgnoreCase))
-            {
+                // this may not work, but if the client is that broken we can not do anything better
                 return "aac";
             }
 
-            if (string.Equals(ext, ".wma", StringComparison.OrdinalIgnoreCase))
-            {
-                return "wma";
-            }
+            var inferredCodec = container.ToLowerInvariant();
 
-            if (string.Equals(ext, ".ogg", StringComparison.OrdinalIgnoreCase))
+            return inferredCodec switch
             {
-                return "vorbis";
-            }
-
-            if (string.Equals(ext, ".oga", StringComparison.OrdinalIgnoreCase))
-            {
-                return "vorbis";
-            }
-
-            if (string.Equals(ext, ".ogv", StringComparison.OrdinalIgnoreCase))
-            {
-                return "vorbis";
-            }
-
-            if (string.Equals(ext, ".webm", StringComparison.OrdinalIgnoreCase))
-            {
-                return "vorbis";
-            }
-
-            if (string.Equals(ext, ".webma", StringComparison.OrdinalIgnoreCase))
-            {
-                return "vorbis";
-            }
-
-            return "copy";
+                "ogg" or "oga" or "ogv" or "webm" or "webma" => "opus",
+                "m4a" or "m4b" or "mp4" or "mov" or "mkv" or "mka" => "aac",
+                "ts" or "avi" or "flv" or "f4v" or "swf" => "mp3",
+                _ => inferredCodec
+            };
         }
 
         /// <summary>
@@ -2695,6 +2668,7 @@ namespace MediaBrowser.Controller.MediaEncoding
         public string GetFastSeekCommandLineParameter(EncodingJobInfo state, EncodingOptions options, string segmentContainer)
         {
             var time = state.BaseRequest.StartTimeTicks ?? 0;
+            var maxTime = state.RunTimeTicks ?? 0;
             var seekParam = string.Empty;
 
             if (time > 0)
@@ -2705,6 +2679,14 @@ namespace MediaBrowser.Controller.MediaEncoding
                 // This will help subtitle syncing.
                 var isHlsRemuxing = state.IsVideoRequest && state.TranscodingType is TranscodingJobType.Hls && IsCopyCodec(state.OutputVideoCodec);
                 var seekTick = isHlsRemuxing ? time + 5000000L : time;
+
+                // Seeking beyond EOF makes no sense in transcoding. Clamp the seekTick value to
+                // [0, RuntimeTicks - 0.5s], so that the muxer gets packets and avoid error codes.
+                if (maxTime > 0)
+                {
+                    seekTick = Math.Clamp(seekTick, 0, Math.Max(maxTime - 5000000L, 0));
+                }
+
                 seekParam += string.Format(CultureInfo.InvariantCulture, "-ss {0}", _mediaEncoder.GetTimeParameter(seekTick));
 
                 if (state.IsVideoRequest)
@@ -3441,7 +3423,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                     algorithmString = algorithm.ToString().ToLowerInvariant();
                 }
 
-                tonemapArg = ":tonemapping=" + algorithm + ":peak_detect=0:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
+                tonemapArg = $":tonemapping={algorithmString}:peak_detect=0:color_primaries=bt709:color_trc=bt709:colorspace=bt709";
 
                 if (range == TonemappingRange.tv || range == TonemappingRange.pc)
                 {
@@ -4125,6 +4107,12 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 var outFormat = doOclTonemap ? "yuv420p10le" : (hasGraphicalSubs ? "yuv420p" : "nv12");
                 var swScaleFilter = GetSwScaleFilter(state, options, vidEncoder, swpInW, swpInH, threeDFormat, reqW, reqH, reqMaxW, reqMaxH);
+                if (isMjpegEncoder && !doOclTonemap)
+                {
+                    // sw decoder + hw mjpeg encoder
+                    swScaleFilter = string.IsNullOrEmpty(swScaleFilter) ? "scale=out_range=pc" : $"{swScaleFilter}:out_range=pc";
+                }
+
                 // sw scale
                 mainFilters.Add(swScaleFilter);
                 mainFilters.Add($"format={outFormat}");
@@ -4143,6 +4131,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 var twoPassVppTonemap = isRext;
                 var doVppFullRangeOut = isMjpegEncoder
                     && _mediaEncoder.EncoderVersion >= _minFFmpegQsvVppOutRangeOption;
+                var doVppScaleModeHq = isMjpegEncoder
+                    && _mediaEncoder.EncoderVersion >= _minFFmpegQsvVppScaleModeOption;
                 var doVppProcamp = false;
                 var procampParams = string.Empty;
                 if (doVppTonemap)
@@ -4169,17 +4159,17 @@ namespace MediaBrowser.Controller.MediaEncoding
                 outFormat = twoPassVppTonemap ? "p010" : outFormat;
 
                 var swapOutputWandH = doVppTranspose && swapWAndH;
-                var hwScalePrefix = (doVppTranspose || doVppTonemap || doVppFullRangeOut) ? "vpp" : "scale";
-                var hwScaleFilter = GetHwScaleFilter(hwScalePrefix, "qsv", outFormat, swapOutputWandH, swpInW, swpInH, reqW, reqH, reqMaxW, reqMaxH);
+                var hwScaleFilter = GetHwScaleFilter("vpp", "qsv", outFormat, swapOutputWandH, swpInW, swpInH, reqW, reqH, reqMaxW, reqMaxH);
 
                 if (!string.IsNullOrEmpty(hwScaleFilter) && doVppTranspose)
                 {
                     hwScaleFilter += $":transpose={tranposeDir}";
                 }
 
-                if (!string.IsNullOrEmpty(hwScaleFilter) && doVppFullRangeOut)
+                if (!string.IsNullOrEmpty(hwScaleFilter) && isMjpegEncoder)
                 {
-                    hwScaleFilter += ":out_range=pc";
+                    hwScaleFilter += (doVppFullRangeOut && !doOclTonemap) ? ":out_range=pc" : string.Empty;
+                    hwScaleFilter += doVppScaleModeHq ? ":scale_mode=hq" : string.Empty;
                 }
 
                 if (!string.IsNullOrEmpty(hwScaleFilter) && doVppTonemap)
@@ -4389,6 +4379,12 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 var outFormat = doOclTonemap ? "yuv420p10le" : (hasGraphicalSubs ? "yuv420p" : "nv12");
                 var swScaleFilter = GetSwScaleFilter(state, options, vidEncoder, swpInW, swpInH, threeDFormat, reqW, reqH, reqMaxW, reqMaxH);
+                if (isMjpegEncoder && !doOclTonemap)
+                {
+                    // sw decoder + hw mjpeg encoder
+                    swScaleFilter = string.IsNullOrEmpty(swScaleFilter) ? "scale=out_range=pc" : $"{swScaleFilter}:out_range=pc";
+                }
+
                 // sw scale
                 mainFilters.Add(swScaleFilter);
                 mainFilters.Add($"format={outFormat}");
@@ -4407,6 +4403,8 @@ namespace MediaBrowser.Controller.MediaEncoding
                 var isRext = IsVideoStreamHevcRext(state);
                 var doVppFullRangeOut = isMjpegEncoder
                     && _mediaEncoder.EncoderVersion >= _minFFmpegQsvVppOutRangeOption;
+                var doVppScaleModeHq = isMjpegEncoder
+                    && _mediaEncoder.EncoderVersion >= _minFFmpegQsvVppScaleModeOption;
 
                 // INPUT vaapi/qsv surface(vram)
                 // hw deint
@@ -4422,11 +4420,9 @@ namespace MediaBrowser.Controller.MediaEncoding
                     mainFilters.Add($"transpose_vaapi=dir={tranposeDir}");
                 }
 
-                var outFormat = doOclTonemap ? ((isQsvDecoder && doVppTranspose) ? "p010" : string.Empty) : "nv12";
-                outFormat = (doTonemap && isRext) ? "p010" : outFormat;
-
+                var outFormat = doTonemap ? (((isQsvDecoder && doVppTranspose) || isRext) ? "p010" : string.Empty) : "nv12";
                 var swapOutputWandH = isQsvDecoder && doVppTranspose && swapWAndH;
-                var hwScalePrefix = (isQsvDecoder && (doVppTranspose || doVppFullRangeOut)) ? "vpp" : "scale";
+                var hwScalePrefix = isQsvDecoder ? "vpp" : "scale";
                 var hwScaleFilter = GetHwScaleFilter(hwScalePrefix, hwFilterSuffix, outFormat, swapOutputWandH, swpInW, swpInH, reqW, reqH, reqMaxW, reqMaxH);
 
                 if (!string.IsNullOrEmpty(hwScaleFilter) && isQsvDecoder && doVppTranspose)
@@ -4434,11 +4430,10 @@ namespace MediaBrowser.Controller.MediaEncoding
                     hwScaleFilter += $":transpose={tranposeDir}";
                 }
 
-                if (!string.IsNullOrEmpty(hwScaleFilter)
-                    && ((isVaapiDecoder && isMjpegEncoder)
-                         || (isQsvDecoder && doVppFullRangeOut)))
+                if (!string.IsNullOrEmpty(hwScaleFilter) && isMjpegEncoder)
                 {
-                    hwScaleFilter += ":out_range=pc";
+                    hwScaleFilter += ((isQsvDecoder && !doVppFullRangeOut) || doOclTonemap) ? string.Empty : ":out_range=pc";
+                    hwScaleFilter += isQsvDecoder ? (doVppScaleModeHq ? ":scale_mode=hq" : string.Empty) : ":mode=hq";
                 }
 
                 // allocate extra pool sizes for vaapi vpp scale
@@ -4715,6 +4710,12 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 var outFormat = doOclTonemap ? "yuv420p10le" : "nv12";
                 var swScaleFilter = GetSwScaleFilter(state, options, vidEncoder, swpInW, swpInH, threeDFormat, reqW, reqH, reqMaxW, reqMaxH);
+                if (isMjpegEncoder && !doOclTonemap)
+                {
+                    // sw decoder + hw mjpeg encoder
+                    swScaleFilter = string.IsNullOrEmpty(swScaleFilter) ? "scale=out_range=pc" : $"{swScaleFilter}:out_range=pc";
+                }
+
                 // sw scale
                 mainFilters.Add(swScaleFilter);
                 mainFilters.Add($"format={outFormat}");
@@ -4750,7 +4751,8 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 if (!string.IsNullOrEmpty(hwScaleFilter) && isMjpegEncoder)
                 {
-                    hwScaleFilter += ":out_range=pc";
+                    hwScaleFilter += doOclTonemap ? string.Empty : ":out_range=pc";
+                    hwScaleFilter += ":mode=hq";
                 }
 
                 // allocate extra pool sizes for vaapi vpp
@@ -5000,9 +5002,9 @@ namespace MediaBrowser.Controller.MediaEncoding
                     // hw scale
                     var hwScaleFilter = GetHwScaleFilter("scale", "vaapi", "nv12", false, inW, inH, reqW, reqH, reqMaxW, reqMaxH);
 
-                    if (!string.IsNullOrEmpty(hwScaleFilter) && isMjpegEncoder)
+                    if (!string.IsNullOrEmpty(hwScaleFilter) && isMjpegEncoder && !doVkTonemap)
                     {
-                        hwScaleFilter += ":out_range=pc";
+                        hwScaleFilter += ":out_range=pc:mode=hq";
                     }
 
                     mainFilters.Add(hwScaleFilter);
@@ -5177,6 +5179,12 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 outFormat = doOclTonemap ? "yuv420p10le" : "nv12";
                 var swScaleFilter = GetSwScaleFilter(state, options, vidEncoder, swpInW, swpInH, threeDFormat, reqW, reqH, reqMaxW, reqMaxH);
+                if (isMjpegEncoder && !doOclTonemap)
+                {
+                    // sw decoder + hw mjpeg encoder
+                    swScaleFilter = string.IsNullOrEmpty(swScaleFilter) ? "scale=out_range=pc" : $"{swScaleFilter}:out_range=pc";
+                }
+
                 // sw scale
                 mainFilters.Add(swScaleFilter);
                 mainFilters.Add("format=" + outFormat);
@@ -5204,7 +5212,8 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 if (!string.IsNullOrEmpty(hwScaleFilter) && isMjpegEncoder)
                 {
-                    hwScaleFilter += ":out_range=pc";
+                    hwScaleFilter += doOclTonemap ? string.Empty : ":out_range=pc";
+                    hwScaleFilter += ":mode=hq";
                 }
 
                 // allocate extra pool sizes for vaapi vpp
@@ -5610,6 +5619,12 @@ namespace MediaBrowser.Controller.MediaEncoding
 
                 var outFormat = doOclTonemap ? "yuv420p10le" : (hasGraphicalSubs ? "yuv420p" : "nv12");
                 var swScaleFilter = GetSwScaleFilter(state, options, vidEncoder, swpInW, swpInH, threeDFormat, reqW, reqH, reqMaxW, reqMaxH);
+                if (isMjpegEncoder && !doOclTonemap)
+                {
+                    // sw decoder + hw mjpeg encoder
+                    swScaleFilter = string.IsNullOrEmpty(swScaleFilter) ? "scale=out_range=pc" : $"{swScaleFilter}:out_range=pc";
+                }
+
                 if (!string.IsNullOrEmpty(swScaleFilter))
                 {
                     swScaleFilter += ":flags=fast_bilinear";
@@ -5670,7 +5685,7 @@ namespace MediaBrowser.Controller.MediaEncoding
             if (doOclTonemap && isRkmppDecoder)
             {
                 // map from rkmpp/drm to opencl via drm-opencl interop.
-                mainFilters.Add("hwmap=derive_device=opencl:mode=read");
+                mainFilters.Add("hwmap=derive_device=opencl");
             }
 
             // ocl tonemap
@@ -5713,7 +5728,7 @@ namespace MediaBrowser.Controller.MediaEncoding
                 {
                     // OUTPUT drm(nv12) surface(gem/dma-heap)
                     // reverse-mapping via drm-opencl interop.
-                    mainFilters.Add("hwmap=derive_device=rkmpp:mode=write:reverse=1");
+                    mainFilters.Add("hwmap=derive_device=rkmpp:reverse=1");
                     mainFilters.Add("format=drm_prime");
                 }
             }
@@ -6823,7 +6838,7 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             if (!string.IsNullOrEmpty(state.InputVideoSync))
             {
-                inputModifier += " -vsync " + state.InputVideoSync;
+                inputModifier += GetVideoSyncOption(state.InputVideoSync, _mediaEncoder.EncoderVersion);
             }
 
             if (state.ReadInputAtNativeFramerate && state.InputProtocol != MediaProtocol.Rtsp)
@@ -7246,7 +7261,7 @@ namespace MediaBrowser.Controller.MediaEncoding
 
             if (!string.IsNullOrEmpty(state.OutputVideoSync))
             {
-                args += " -vsync " + state.OutputVideoSync;
+                args += GetVideoSyncOption(state.OutputVideoSync, _mediaEncoder.EncoderVersion);
             }
 
             args += GetOutputFFlags(state);
@@ -7418,6 +7433,34 @@ namespace MediaBrowser.Controller.MediaEncoding
         {
             return state.SubtitleDeliveryMethod == SubtitleDeliveryMethod.Encode
                    || (state.BaseRequest.AlwaysBurnInSubtitleWhenTranscoding && !IsCopyCodec(state.OutputVideoCodec));
+        }
+
+        public static string GetVideoSyncOption(string videoSync, Version encoderVersion)
+        {
+            if (string.IsNullOrEmpty(videoSync))
+            {
+                return string.Empty;
+            }
+
+            if (encoderVersion >= new Version(5, 1))
+            {
+                if (int.TryParse(videoSync, CultureInfo.InvariantCulture, out var vsync))
+                {
+                    return vsync switch
+                    {
+                        -1 => " -fps_mode auto",
+                        0 => " -fps_mode passthrough",
+                        1 => " -fps_mode cfr",
+                        2 => " -fps_mode vfr",
+                        _ => string.Empty
+                    };
+                }
+
+                return string.Empty;
+            }
+
+            // -vsync is deprecated in FFmpeg 5.1 and will be removed in the future.
+            return $" -vsync {videoSync}";
         }
     }
 }

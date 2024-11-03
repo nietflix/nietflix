@@ -208,6 +208,14 @@ namespace MediaBrowser.Model.Dlna
 
                 var longBitrate = Math.Min(transcodingBitrate, playlistItem.AudioBitrate ?? transcodingBitrate);
                 playlistItem.AudioBitrate = longBitrate > int.MaxValue ? int.MaxValue : Convert.ToInt32(longBitrate);
+
+                // Pure audio transcoding does not support comma separated list of transcoding codec at the moment.
+                // So just use the AudioCodec as is would be safe enough as the _transcoderSupport.CanEncodeToAudioCodec
+                // would fail so this profile will not even be picked up.
+                if (playlistItem.AudioCodecs.Count == 0 && !string.IsNullOrWhiteSpace(transcodingProfile.AudioCodec))
+                {
+                    playlistItem.AudioCodecs = [transcodingProfile.AudioCodec];
+                }
             }
 
             playlistItem.TranscodeReasons = transcodeReasons;
@@ -389,9 +397,10 @@ namespace MediaBrowser.Model.Dlna
         /// <param name="type">The <see cref="DlnaProfileType"/>.</param>
         /// <param name="playProfile">The <see cref="DirectPlayProfile"/> object to get the video stream from.</param>
         /// <returns>The normalized input container.</returns>
-        public static string NormalizeMediaSourceFormatIntoSingleContainer(string inputContainer, DeviceProfile? profile, DlnaProfileType type, DirectPlayProfile? playProfile = null)
+        public static string? NormalizeMediaSourceFormatIntoSingleContainer(string inputContainer, DeviceProfile? profile, DlnaProfileType type, DirectPlayProfile? playProfile = null)
         {
-            if (profile is null || !inputContainer.Contains(',', StringComparison.OrdinalIgnoreCase))
+            // If the source is Live TV the inputContainer will be null until the mediasource is probed on first access
+            if (profile is null || string.IsNullOrEmpty(inputContainer) || !inputContainer.Contains(',', StringComparison.OrdinalIgnoreCase))
             {
                 return inputContainer;
             }
